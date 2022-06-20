@@ -1,8 +1,14 @@
 /**
- * 相较于 select，poll 的优点
- * 1. 内核中保存一份文件描述符集合，无需用户每次都重新传入，只需告诉内核修改的部分
- * 2. 不再通过轮询的的方式找到就绪的 fd，而是通过异步 IO 事件唤醒 epoll_wait
- * 3. 内核仅会将有事件发生的 fd 返回给用户，用户无需遍历整个 fd 集合
+ * epoll默认的事件触发模式为 Level_triggered
+ * 
+ * Level_triggered（水平触发）模式，即当被监控的文件描述符上有可读/写事件发生时，epoll_wait()会通知处理程序去读写。
+ * 如果没有把数据一次性全部读写完(如读写缓冲区太小)，那么下次调用 epoll_wait()时，它还会通知在上没读写完的文件描述符上继续读写
+ * 
+ * Edge_triggered（边缘触发）：当被监控的文件描述符上有可读写事件发生时，epoll_wait()会通知处理程序去读写。
+ * 如果这次没有把数据全部读写完(如读写缓冲区太小)，那么下次调用epoll_wait()时，它不会通知你，也就是它只会通知一次，直到该文件描述符上出现第二次可读写事件才会通知！
+ * 
+ * 边缘触发模式效率较高，但是复杂度也会提升，一般不使用。
+ * 使用边缘触发模式一定要把 fd 置为非阻塞模式，多次读取直到完毕
  * */
 
 #include <stdio.h>
@@ -21,6 +27,17 @@
 
 int initserver(int port);
 
+static void set_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags == -1) {
+    perror("fcntl()");
+    return;
+  }
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    perror("fcntl()");
+  }
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 2)
@@ -37,6 +54,8 @@ int main(int argc, char *argv[])
         return -1;
     }
     printf("listensock=%d\n", listensock);
+
+    set_nonblocking(listensock);
 
     // 创建一个新的 epoll 实例，返回对应的 fd，参数无用，大于0即可
     int epollfd = epoll_create(1);
@@ -59,7 +78,8 @@ int main(int argc, char *argv[])
     struct epoll_event ev;
     ev.data.fd = listensock;
     // 相关的 fd 有数据可读的情况，包括新客户端的连接、客户端socket有数据可读和客户端socket断开三种情况
-    ev.events = EPOLLIN;
+    // !!!! 这里和默认的 LT 不同
+    ev.events = EPOLLIN | EPOLLET;
 
     /**
      * int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
@@ -85,6 +105,7 @@ int main(int argc, char *argv[])
          * 返回值：返回有事件发生的 fd 数量，0 表示 timeout 期间都没有事件发生，-1 error
          * */
         int readyfds = epoll_wait(epollfd, events, MAXEVENTS, -1);
+
         if (readyfds == -1)
         {
             perror("epoll() failed");
@@ -94,7 +115,7 @@ int main(int argc, char *argv[])
         // 检查有事情发生的socket，包括监听和客户端连接的socket。
         for (int i = 0; i < readyfds; i++)
         {
-            if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) ||
+             if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) ||
                 (!(events[i].events & EPOLLIN))) {
                 // error case
                 printf("epoll error\n");
@@ -102,7 +123,7 @@ int main(int argc, char *argv[])
                 continue;
             }
             // 新的客户端连接
-            if (events[i].data.fd == listensock)
+            if ((events[i].data.fd == listensock))
             {
                 struct sockaddr_in client;
                 socklen_t len = sizeof(client);
@@ -127,9 +148,11 @@ int main(int argc, char *argv[])
 
                 printf("client(socket=%d) connected ok.\n", clientsock);
 
+                set_nonblocking(clientsock);
+
                 memset(&ev, 0, sizeof(struct epoll_event));
                 ev.data.fd = clientsock;
-                ev.events = EPOLLIN;
+                ev.events = EPOLLIN | EPOLLET;
                 epoll_ctl(epollfd, EPOLL_CTL_ADD, clientsock, &ev);
 
                 continue;    
@@ -137,28 +160,32 @@ int main(int argc, char *argv[])
             else
             {
                 // 客户端有数据过来或客户端的socket连接被断开。
-                char buffer[1024];
+                char buffer[5];
                 memset(buffer, 0, sizeof(buffer));
 
-                // 读取客户端的数据。
-                ssize_t isize = read(events[i].data.fd, buffer, sizeof(buffer));
-                // 发生了错误或socket被对方关闭。
-                if (isize <= 0)
+                for(;;) 
                 {
-                    printf("client(eventfd=%d) disconnected.\n", events[i].data.fd);
-                    
-                    memset(&ev, 0, sizeof(struct epoll_event));
-                    ev.data.fd = events[i].data.fd;
-                    ev.events = EPOLLIN;
-                    // 从 epollfd 实例中移除对该 fd 的事件监视
-                    epoll_ctl(epollfd, EPOLL_CTL_DEL, events[i].data.fd, &ev);
-                    close(events[i].data.fd);
-                    continue;
-                }
+                    // 读取客户端的数据。
+                    ssize_t isize = read(events[i].data.fd, buffer, sizeof(buffer));
 
-                printf("recv(eventfd=%d,size=%ld):%s\n", events[i].data.fd, isize, buffer);
-                // 把收到的报文发回给客户端。
-                write(events[i].data.fd, buffer, strlen(buffer));
+                    if (isize == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            printf("finished reading data from client\n");
+                            break;
+                        } else {
+                            perror("read()");
+                            return 1;
+                        }
+                    } else if (isize == 0) {
+                        printf("finished with %d\n", events[i].data.fd);
+                        close(events[i].data.fd);
+                        break;
+                    }
+
+                    printf("recv(eventfd=%d,size=%ld):%s\n", events[i].data.fd, isize, buffer);
+                    // 把收到的报文发回给客户端。
+                    write(events[i].data.fd, buffer, strlen(buffer));
+                }
             }
         }
     }

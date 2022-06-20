@@ -59,17 +59,10 @@ int main(int argc, char *argv[])
          *
          * **/
         int ready = poll(pfds, maxfd+1, -1);
-
-        // -1 error
-        if (ready < 0)
+        if (ready == -1)
         {
             perror("poll() failed");
             break;
-        }
-        if (ready == 0)
-        {
-            printf("timeout\n");
-            continue;
         }
 
         // 检查有事情发生的socket，包括监听和客户端连接的socket。
