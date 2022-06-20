@@ -9,6 +9,9 @@
  * 
  * 边缘触发模式效率较高，但是复杂度也会提升，一般不使用。
  * 使用边缘触发模式一定要把 fd 置为非阻塞模式，多次读取直到完毕
+ * 
+ * https://eklitzke.org/blocking-io-nonblocking-io-and-epoll
+ * 
  * */
 
 #include <stdio.h>
